@@ -244,8 +244,8 @@ static void makePlane(const mjModel* m, mjrContext* con) {
 
 // model-specific meshes
 static void makeMesh(const mjModel* m, mjrContext* con) {
-  // allocate list
-  listAllocate(&con->baseMesh, &con->rangeMesh, 2*m->nmesh);
+  // set range, records are already allocated by makeSkin
+  con->rangeMesh = 2*m->nmesh;
 
   // process meshes
   for (int i=0; i < m->nmesh; i++) {
@@ -255,140 +255,139 @@ static void makeMesh(const mjModel* m, mjrContext* con) {
 
 
 
+// get buffer record of a mesh or convex hull
+mjrMeshBuffer* mjr_getMeshBuffer(const mjrContext* con, int dataid) {
+  if (dataid < 0 || dataid >= con->rangeMesh) {
+    return NULL;
+  }
+  return (mjrMeshBuffer*)(con->skinvertVBO + con->nskin) + dataid;
+}
+
+
+
+// append vertex to array, return advanced array pointer
+static float* addMeshVert(float* dst, const float* normal, const float* texcoord,
+                          const float* vert) {
+  memcpy(dst, normal, 3*sizeof(float));
+  if (texcoord) {
+    memcpy(dst+3, texcoord, 2*sizeof(float));
+  } else {
+    dst[3] = dst[4] = 0;
+  }
+  memcpy(dst+5, vert, 3*sizeof(float));
+  return dst + mjrMESHVERTSIZE;
+}
+
+
+
+// upload vertices to buffer, replacing the old contents
+static void uploadMeshBuffer(mjrMeshBuffer* buffer, const float* data, int nvert,
+                             int has_texcoord) {
+  // delete old buffer
+  if (buffer->vbo) {
+    glDeleteBuffers(1, &buffer->vbo);
+  }
+  memset(buffer, 0, sizeof(mjrMeshBuffer));
+
+  // upload new
+  if (nvert) {
+    glGenBuffers(1, &buffer->vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, buffer->vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nvert*mjrMESHVERTSIZE*sizeof(float), data,
+                 GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    buffer->nvert = nvert;
+    buffer->has_texcoord = has_texcoord;
+  }
+}
+
+
+
 // (re) upload mesh to GPU
 void mjr_uploadMesh(const mjModel* m, const mjrContext* con, int meshid) {
-  int vertadr, numvert, normaladr, numface, texcoordadr;
-  float normal[3], *v1, *v2, *v3, *n1, *n2, *n3, *t1, *t2, *t3;
-
   // check index
   if (meshid < 0 || meshid >= m->nmesh) {
     mju_error("Invalid mesh index %d", meshid);
   }
 
-  // delete old lists (mesh and convex hull)
-  glDeleteLists(con->baseMesh + 2*meshid, 2);
+  // get buffer records (mesh and convex hull)
+  mjrMeshBuffer* buffer = mjr_getMeshBuffer(con, 2*meshid);
+  if (!buffer) {
+    mju_error("Mesh index %d is not allocated in mjrContext", meshid);
+  }
 
-  // get vertex and texcoord address for this mesh
-  vertadr = m->mesh_vertadr[meshid];
-  normaladr = m->mesh_normaladr[meshid];
-  texcoordadr = m->mesh_texcoordadr[meshid];
+  // get addresses for this mesh
+  int vertadr = m->mesh_vertadr[meshid];
+  int normaladr = m->mesh_normaladr[meshid];
+  int texcoordadr = m->mesh_texcoordadr[meshid];
+  int facenum = m->mesh_facenum[meshid];
 
-  // render original mesh
-  glNewList(con->baseMesh + 2*meshid, GL_COMPILE);
-  glBegin(GL_TRIANGLES);
-  for (int face = m->mesh_faceadr[meshid];
-       face < m->mesh_faceadr[meshid] + m->mesh_facenum[meshid];
-       face++) {
-    // compute vertex addresses
-    v1 = m->mesh_vert + 3*(m->mesh_face[3*face]   + vertadr);
-    v2 = m->mesh_vert + 3*(m->mesh_face[3*face+1] + vertadr);
-    v3 = m->mesh_vert + 3*(m->mesh_face[3*face+2] + vertadr);
+  // get convex hull sizes
+  int graphadr = m->mesh_graphadr[meshid];
+  int hullvertnum = graphadr >= 0 ? m->mesh_graph[graphadr] : 0;
+  int hullfacenum = graphadr >= 0 ? m->mesh_graph[graphadr+1] : 0;
 
-    // compute normal addresses
-    n1 = m->mesh_normal + 3*(m->mesh_facenormal[3*face]   + normaladr);
-    n2 = m->mesh_normal + 3*(m->mesh_facenormal[3*face+1] + normaladr);
-    n3 = m->mesh_normal + 3*(m->mesh_facenormal[3*face+2] + normaladr);
+  // allocate vertex data, shared by mesh and convex hull
+  int maxface = mjMAX(facenum, hullfacenum);
+  float* data = NULL;
+  if (maxface) {
+    data = (float*) mju_malloc(3*(size_t)maxface*mjrMESHVERTSIZE*sizeof(float));
+  }
 
-    // compute texcoord addresses
-    if (texcoordadr >= 0) {
-      t1 = m->mesh_texcoord + 2*(m->mesh_facetexcoord[3*face]   + texcoordadr);
-      t2 = m->mesh_texcoord + 2*(m->mesh_facetexcoord[3*face+1] + texcoordadr);
-      t3 = m->mesh_texcoord + 2*(m->mesh_facetexcoord[3*face+2] + texcoordadr);
-    } else {
-      t1 = t2 = t3 = NULL;
+  // original mesh
+  float* dst = data;
+  for (int face = m->mesh_faceadr[meshid]; face < m->mesh_faceadr[meshid] + facenum; face++) {
+    // compute face normal
+    const float* v[3];
+    float normal[3];
+    for (int k=0; k < 3; k++) {
+      v[k] = m->mesh_vert + 3*(m->mesh_face[3*face+k] + vertadr);
     }
+    mjr_makeNormal(normal, v[0], v[1], v[2]);
+
+    // add vertices
+    for (int k=0; k < 3; k++) {
+      const float* n = m->mesh_normal + 3*(m->mesh_facenormal[3*face+k] + normaladr);
+      const float* t = NULL;
+      if (texcoordadr >= 0) {
+        t = m->mesh_texcoord + 2*(m->mesh_facetexcoord[3*face+k] + texcoordadr);
+      }
+
+      // no texcoord: use face normal if vertex normal is too far from it
+      else if (n[0]*normal[0]+n[1]*normal[1]+n[2]*normal[2] < 0.8) {
+        n = normal;
+      }
+      dst = addMeshVert(dst, n, t, v[k]);
+    }
+  }
+  uploadMeshBuffer(buffer, data, 3*facenum, texcoordadr >= 0);
+
+  // convex hull if present
+  dst = data;
+  for (int face=0; face < hullfacenum; face++) {
+    // face address in graph
+    int j = graphadr + 2 + 3*hullvertnum + 3*hullfacenum + 3*face;
 
     // compute face normal
-    mjr_makeNormal(normal, v1, v2, v3);
-
-    // make OpenGL triangle
-    // vertex1
-    if (t1) {
-      glTexCoord2fv(t1);
-      glNormal3fv(n1);
-    } else {
-      if (n1[0]*normal[0]+n1[1]*normal[1]+n1[2]*normal[2] < 0.8) {
-        glNormal3fv(normal);
-      } else {
-        glNormal3fv(n1);
-      }
+    const float* v[3];
+    float normal[3];
+    for (int k=0; k < 3; k++) {
+      v[k] = m->mesh_vert + 3*(m->mesh_graph[j+k] + vertadr);
     }
-    glVertex3fv(v1);
+    mjr_makeNormal(normal, v[0], v[1], v[2]);
 
-    // vertex2
-    if (t2) {
-      glTexCoord2fv(t2);
-      glNormal3fv(n2);
-    } else {
-      if (n2[0]*normal[0]+n2[1]*normal[1]+n2[2]*normal[2] < 0.8) {
-        glNormal3fv(normal);
-      } else {
-        glNormal3fv(n2);
-      }
-    }
-    glVertex3fv(v2);
-
-    // vertex3
-    if (t3) {
-      glTexCoord2fv(t3);
-      glNormal3fv(n3);
-    } else {
-      if (n3[0]*normal[0]+n3[1]*normal[1]+n3[2]*normal[2] < 0.8) {
-        glNormal3fv(normal);
-      } else {
-        glNormal3fv(n3);
-      }
-    }
-    glVertex3fv(v3);
-  }
-  glEnd();
-  glEndList();
-
-  // render convex hull if present
-  if (m->mesh_graphadr[meshid] >= 0) {
-    // get sizes of convex hull
-    numvert = m->mesh_graph[m->mesh_graphadr[meshid]];
-    numface = m->mesh_graph[m->mesh_graphadr[meshid]+1];
-
-    glNewList(con->baseMesh + 2*meshid+1, GL_COMPILE);
-    glBegin(GL_TRIANGLES);
-    for (int face=0; face < numface; face++) {
-      // face address in graph
-      int j = m->mesh_graphadr[meshid] + 2 + 3*numvert + 3*numface + 3*face;
-
-      // compute vertex addresses
-      v1 = m->mesh_vert + 3*(m->mesh_graph[j]   + vertadr);
-      v2 = m->mesh_vert + 3*(m->mesh_graph[j+1] + vertadr);
-      v3 = m->mesh_vert + 3*(m->mesh_graph[j+2] + vertadr);
-
-      // compute texcoord addresses
+    // add vertices
+    for (int k=0; k < 3; k++) {
+      const float* t = NULL;
       if (texcoordadr >= 0) {
-        t1 = m->mesh_texcoord + 2*(m->mesh_graph[j]   + texcoordadr);
-        t2 = m->mesh_texcoord + 2*(m->mesh_graph[j+1] + texcoordadr);
-        t3 = m->mesh_texcoord + 2*(m->mesh_graph[j+2] + texcoordadr);
-      } else {
-        t1 = t2 = t3 = NULL;
+        t = m->mesh_texcoord + 2*(m->mesh_graph[j+k] + texcoordadr);
       }
-
-      // make OpenGL triangle
-      mjr_makeNormal(normal, v1, v2, v3);
-      glNormal3fv(normal);
-
-      // vertex 1
-      if (t1) glTexCoord2fv(t1);
-      glVertex3fv(v1);
-
-      // vertex 2
-      if (t2) glTexCoord2fv(t2);
-      glVertex3fv(v2);
-
-      // vertex 3
-      if (t3) glTexCoord2fv(t3);
-      glVertex3fv(v3);
+      dst = addMeshVert(dst, normal, t, v[k]);
     }
-    glEnd();
-    glEndList();
   }
+  uploadMeshBuffer(buffer+1, data, 3*hullfacenum, texcoordadr >= 0);
+
+  mju_free(data);
 }
 
 
@@ -1569,10 +1568,16 @@ static void makeSkin(const mjModel* m, mjrContext* con) {
   // save number of skins (so we can delete context without model)
   con->nskin = m->nskin;
 
+  // allocate skin vertex VBO names, followed by mesh buffer records (see mjr_getMeshBuffer)
+  if (nskin || m->nmesh) {
+    size_t sz = nskin*sizeof(unsigned int) + 2*(size_t)m->nmesh*sizeof(mjrMeshBuffer);
+    con->skinvertVBO = (unsigned int*) mju_malloc(sz);
+    memset(con->skinvertVBO, 0, sz);
+  }
+
   // allocate buffers
   if (nskin) {
-    // allocate VBO names
-    con->skinvertVBO     = (unsigned int*) mju_malloc(nskin*sizeof(int));
+    // allocate other VBO names
     con->skinnormalVBO   = (unsigned int*) mju_malloc(nskin*sizeof(int));
     con->skintexcoordVBO = (unsigned int*) mju_malloc(nskin*sizeof(int));
     con->skinfaceVBO     = (unsigned int*) mju_malloc(nskin*sizeof(int));
@@ -1752,10 +1757,10 @@ void mjr_makeContext_offSize(const mjModel* m, mjrContext* con, int fontscale,
   makeMaterial(m, con);
   makeTexture(m, con);
   makePlane(m, con);
+  makeSkin(m, con);
   makeMesh(m, con);
   makeHField(m, con);
   makeBuiltin(m, con);
-  makeSkin(m, con);
   makeFont(con, fontscale);
 
   // enable seamless cube maps if supported
@@ -1948,7 +1953,9 @@ void mjr_freeContext(mjrContext* con) {
     if (con->auxFBO_r[i]) glDeleteFramebuffers(1, con->auxFBO_r + i);
   }
   if (con->rangePlane) glDeleteLists(con->basePlane, con->rangePlane);
-  if (con->rangeMesh) glDeleteLists(con->baseMesh, con->rangeMesh);
+  for (int i=0; i < con->rangeMesh; i++) {
+    glDeleteBuffers(1, &mjr_getMeshBuffer(con, i)->vbo);
+  }
   if (con->rangeHField) glDeleteLists(con->baseHField, con->rangeHField);
   if (con->rangeBuiltin) glDeleteLists(con->baseBuiltin, con->rangeBuiltin);
   if (con->rangeFont) {
@@ -1965,11 +1972,13 @@ void mjr_freeContext(mjrContext* con) {
     glDeleteBuffers(con->nskin, con->skintexcoordVBO);
     glDeleteBuffers(con->nskin, con->skinfaceVBO);
 
-    mju_free(con->skinvertVBO);
     mju_free(con->skinnormalVBO);
     mju_free(con->skintexcoordVBO);
     mju_free(con->skinfaceVBO);
   }
+
+  // free skin vertex VBO names and mesh buffer records
+  mju_free(con->skinvertVBO);
 
   // clear fields
   mjr_defaultContext(con);

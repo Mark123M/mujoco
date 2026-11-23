@@ -267,6 +267,35 @@ enum {
 };
 
 
+// render mesh or convex hull from its static vertex buffer
+static void renderMesh(const mjrMeshBuffer* buffer) {
+  if (!buffer || !buffer->vbo) {
+    return;
+  }
+
+  // set pointers: interleaved normal, texcoord, position
+  const GLsizei stride = mjrMESHVERTSIZE*sizeof(float);
+  glBindBuffer(GL_ARRAY_BUFFER, buffer->vbo);
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glVertexPointer(3, GL_FLOAT, stride, (const void*)(5*sizeof(float)));
+  glEnableClientState(GL_NORMAL_ARRAY);
+  glNormalPointer(GL_FLOAT, stride, NULL);
+  if (buffer->has_texcoord) {
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, stride, (const void*)(3*sizeof(float)));
+  }
+
+  // draw
+  glDrawArrays(GL_TRIANGLES, 0, buffer->nvert);
+
+  // restore
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glDisableClientState(GL_VERTEX_ARRAY);
+  glDisableClientState(GL_NORMAL_ARRAY);
+  glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+}
+
+
 // render one geom
 static void renderGeom(const mjvGeom* geom, int mode, const float* headpos,
                        const mjvScene* scn, const mjrContext* con) {
@@ -417,9 +446,7 @@ static void renderGeom(const mjvGeom* geom, int mode, const float* headpos,
 
   case mjGEOM_MESH:                           // mesh
   case mjGEOM_SDF:
-    if (geom->dataid >= 0) {
-      glCallList(con->baseMesh + geom->dataid);
-    }
+    renderMesh(mjr_getMeshBuffer(con, geom->dataid));
     break;
 
   case mjGEOM_ARROW:                          // arrow

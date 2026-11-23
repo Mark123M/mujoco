@@ -37,6 +37,20 @@ enum {
   mjrNUM
 };
 
+// static vertex buffer of a mesh or convex hull: interleaved normal, texcoord, position
+typedef struct {
+  unsigned int vbo;                 // buffer name (0: nothing to draw)
+  int nvert;                        // number of vertices, 3 per triangle
+  int has_texcoord;                 // does the buffer have texture coordinates
+} mjrMeshBuffer;
+
+#define mjrMESHVERTSIZE 8           // floats per vertex in mjrMeshBuffer
+
+// get buffer record of a mesh (2*meshid) or convex hull (2*meshid+1), NULL if out of range
+//  the records live in the skinvertVBO allocation, after the nskin buffer names,
+//  so that the layout of mjrContext is unchanged
+mjrMeshBuffer* mjr_getMeshBuffer(const mjrContext* con, int dataid);
+
 
 // set default mjrContext
 MJAPI void mjr_defaultContext(mjrContext* con);
